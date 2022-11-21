@@ -233,6 +233,7 @@ end
 ##########################################
 
 function SteadyState(Params)
+    Params = params
     @unpack r, β, σ, amin, amax, Na, ρ, σ_y, Ns = Params
     Agrid = DiscretizeAssets(amin,amax,Na)
     y, py, Py = DiscretizeIncome(ρ, σ_y, Ns)
@@ -244,13 +245,52 @@ function SteadyState(Params)
              C = dot(cpol, D), P = Py, Agrid = Agrid, y = y, r = r, β = β,
              σ = σ)
 end
+
+function SteadyStateManual(P, Agrid, y, r, β, σ)
+    Va, apol, cpol = PolicySS(P, Agrid, y, r, β, σ)
+    D = SSDistribution(P, apol, Agrid)
+
+    return (; D = D, Va = Va, apol = apol, cpol = cpol, A = dot(apol, D),
+             C = dot(cpol, D), P = P, Agrid = Agrid, y = y, r = r, β = β,
+             σ = σ)
+end
+
 #params = IncompleteMarketsParam()
 #ss = SteadyState(params);
 
+#####################
+#### CALIBRATION ####
+#####################
+function BetaCalib(P,Agrid,y,r,σ,beta_low,beta_high,Assetlevel)
+    β_calib = find_zero(x ->  SteadyState(P, Agrid, y, r, x, σ).A - Assetlevel, [beta_low beta_high])
+    ss = ss = SteadyState(P, Agrid, y, r, β_calib, σ)
+    A, C = ss.A, ss.C
+    # Check aggregate steady-state budget balance: C = 1+rA 
+    if isapprox(C, 1+r*A) == 1
+        println("Calibration was succesful")
+    else 
+        println("Calibration failed")
+    end
+    return β_calib
+end
 
 #################################
 ###### GENERAL EQUILIBRIUM ######
 #################################
+
+function BetaCalibGE(Pi, Agrid, τ, e, r, σ, B)
+    β_ge = find_zero(x ->  SteadyState(Pi, Agrid, (1-τ)*e, r, x, σ).A - B, [0.98 0.995])    # Calibrate β to be consistentwith asset market clearing A = B
+    ss_ge = SteadyState(Pi, Agrid, (1-τ)*e, r, β_ge, σ)
+    A_ge, C_ge = ss_ge.A, ss_ge.C
+
+    if isapprox(C_ge, 1) == 1 & isapprox(A_ge, B) == 1
+        println("Calibration succesful")
+    else 
+        println("Calibration unsuccesful")
+    end
+    return β_ge
+end
+
 
 # GE counterfactuals: As income risk increases, so does the demand for assets to help smooth consumption.
 # This brings down the return on assets. 
