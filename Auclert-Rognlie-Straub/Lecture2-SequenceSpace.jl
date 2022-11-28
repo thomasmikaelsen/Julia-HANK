@@ -137,8 +137,11 @@ function zPolicyImpulse(ss, y, rs, zs, T)
     end
     return Va, a, c, taus, ys
 end
-
 Va_z, a_z, c_z, taus_z, ys_z = zPolicyImpulse(ss_ge, ss_ge_y, ss_ge.r*ones(T), Zs, T);
+@tullio ap[i] := a_z[i][4,250]
+@tullio cp[i] := c_z[i][4,250]
+plot(ap)
+plot(cp)
 
 
 function zHouseholdImpulse(ss, y, rs, zs, T)
@@ -340,3 +343,185 @@ For each shocked inuput i (=r) and policy of interest o (=a):
 
 4. Use recursion to obtain J 
 """
+
+function FakeNewsJ(ss, y, Pi, T, h=1e-4)
+    da = zImpulseMap(ss, y, ss.r*ones(T) .+ h * (1:T .== T), ones(T), T)[2].a
+    @tullio da[i] = da[i] - ss_ge.apol  
+    F = zeros(T,T)
+    lottery = GetLottery.(ss.apol; Agrid = ss.Agrid)
+    D1_noshock = ForwardIteration(ss.D, Pi, lottery)
+    @Threads.threads for s in 1:T-1
+        # F(1,s) : change in asset policy times steady state incoming distribution 
+        F[1,s] = sum(ss.D .* da[T-s+1]) / h 
+    
+        # Change in D_1 from this cnage 
+        lottery_shock = GetLottery.(ss.apol + da[T-s+1]; Agrid = ss.Agrid)
+        dD1 = ForwardIteration(ss.D, Pi, lottery_shock) - D1_noshock
+        
+        # Use expectation vectors to project effect on aggregate 
+        curlye = curlyE[1:T-1]
+        @tullio f[i] := sum(curlye[i] .* dD1) / h
+        F[2:end,s] = f 
+    end
+    return JFromF(F)
+end
+
+Jfunc = FakeNewsJ(ss_ge, ss_ge_y, Pi, T);
+
+##### PUTTING IT ALL TOGETHER: CURRENTLY NOT WORKING #####
+function Step1Backward(ss_ge,Pi,T,params)
+    @unpack Ns, Na, β, σ = params
+    # Containers for outcomes and dist, for each type of shock: r, y, tax 
+    curlyAr, curlyAy, curlyAt = zeros(T), zeros(T), zeros(T)
+    curlyCr, curlyCy, curlyCt = zeros(T), zeros(T), zeros(T)
+    curlyDr, curlyDy, curlyDt = [zeros(Ns,Na) for t in 1:T], [zeros(Ns,Na) for t in 1:T] , [zeros(Ns,Na) for t in 1:T]
+
+    # No shock 
+    lottery = GetLottery.(ss_ge.apol; Agrid = ss_ge.Agrid)
+    D1_noshock = ForwardIteration(ss_ge.D, Pi, lottery)
+
+    # Initialize 
+    r_s = ss_ge.r + h
+    e_s = y + h*y
+    y_s = y .+ h
+    for i in 1:3
+        i = 1
+        Va = ss.Va
+        if i == 1
+            for s in 1:T 
+                if s == 1
+                    Va, a, c = EulerBack(Va, Pi, ss_ge.Agrid, y, r_s, β, σ)
+                else 
+                    Va, a, c = EulerBack(Va, Pi, ss_ge.Agrid, y, ss_ge.r, β, σ)
+                end 
+
+                # Aggregate effects on A and C 
+                curlyAr[s] = sum(ss_ge.D .* (a - ss_ge.apol)) / h
+                curlyCr[s] = sum(ss_ge.D .* (c - ss_ge.cpol)) / h
+
+                # Effect on one-period-ahead distribution 
+                lottery = GetLottery.(a; Agrid = ss_ge.Agrid)
+                curlyDr[s] = (ForwardIteration(ss_ge.D, Pi, lottery) - D1_noshock) / h
+            end
+        elseif i == 2
+            for s in 1:T 
+                if s == 1
+                    Va, a, c = EulerBack(Va, Pi, ss_ge.Agrid, e_s, ss_ge.r, β, σ)
+                else 
+                    Va, a, c = EulerBack(Va, Pi, ss_ge.Agrid, y, ss_ge.r, β, σ)
+                end 
+
+                # Aggregate effects on A and C 
+                curlyAy[s] = sum(ss_ge.D .* (a - ss_ge.apol)) / h
+                curlyCy[s] = sum(ss_ge.D .* (c - ss_ge.cpol)) / h
+
+                # Effect on one-period-ahead distribution 
+                lottery = GetLottery.(a; Agrid = ss_ge.Agrid)
+                curlyDy[s] = (ForwardIteration(ss_ge.D, Pi, lottery) - D1_noshock) / h
+            end
+        else 
+            for s in 1:T 
+                if s == 1
+                    Va, a, c = EulerBack(Va, Pi, ss_ge.Agrid, y_s, ss_ge.r, β, σ)
+                else 
+                    Va, a, c = EulerBack(Va, Pi, ss.Agrid, y, ss_ge.r, β, σ)
+                end 
+
+                # Aggregate effects on A and C 
+                curlyAt[s] = sum(ss_ge.D .* (a - ss_ge.apol)) / h
+                curlyCt[s] = sum(ss_ge.D .* (c - ss_ge.cpol)) / h
+
+                # Effect on one-period-ahead distribution 
+                lottery = GetLottery.(a; Agrid = ss_ge.Agrid)
+                curlyDt[s] = (ForwardIteration(ss_ge.D, Pi, lottery) - D1_noshock) / h
+            end
+        end 
+    end
+    return (; curlyAr = curlyAr, curlyAy = curlyAy, curlyAt = curlyAt, 
+              curlyCr = curlyCr, curlyCy = curlyCy, curlyCt = curlyCt, 
+              curlyDr = curlyDr, curlyDy = curlyDy, curlyDt = curlyDt)
+end
+
+test = Step1Backward(ss_ge,Pi,T,params);
+test[3]
+
+function Jacobians(ss_ge, Pi, T, params)
+    @unpack Ns, Na = params
+    # Step 1 
+    curlies = Step1Backward(ss_ge, Pi, T, params)
+
+    # Step 2
+    a_i = [GetLottery(a; Agrid = ss_ge.Agrid)[1] for a in ss_ge.apol]
+    a_pi = [GetLottery(a; Agrid = ss_ge.Agrid)[2] for a in ss_ge.apol]
+    curlyEA = ExpectationVectors(ss_ge.apol, Pi, a_i, a_pi, T)
+    curlyEC = ExpectationVectors(ss_ge.cpol, Pi, a_i, a_pi, T)
+
+    # Step 3 & 4: Fake new matrix and Jacobian
+    JsA = [zeros(T,T) for t in 1:3]
+    JsC = [zeros(T,T) for t in 1:3]
+    for i in 1:2 
+        if i == 1
+            for j in 1:3
+                #j = 1
+                F = zeros(T,T)
+                F[1,:] = curlies[j] 
+                curlye = curlyEA[1:T-1]
+                dD1 = curlies[2*3 + j][1:T-1]
+                @tullio f[k] := sum(curlye[k] .* dD1[k]) / h
+                F[2:end,s] = f 
+                JsA[j] = JFromF(F)
+            end 
+        else 
+            for j in 1:3 
+                F = zeros(T,T)
+                F[1,:] = curlies[3+j]
+                curlye = curlyEC[1:T-1]
+                dD1 = curlies[2*3 + j][1:T-1]
+                @tullio f[k] := sum(curlye[k] .* dD1[k]) / h
+                F[2:end,s] = f 
+                JsC[j] = JFromF(F)
+            end
+        end 
+    end 
+    return (; JsA = JsA, JsC = JsC)
+end
+
+
+
+
+
+##### MANUAL TRY #####
+# Step 1: Interest rate is shocked at time T 
+da = zImpulseMap(ss_ge, ss_ge_y, ss_ge.r*ones(T) .+ h * (1:T .== T), ones(T), T)[2].a
+@tullio da[i] = da[i] - ss_ge.apol
+J_alt = zeros(T,T);
+
+# Start with steady state policy - will add the impulse to this for each shock
+a_ss = [ss_ge.apol .* ones(params.Ns,params.Na) for t in 1:T]
+
+# Fake news matrix 
+F = copy.(J)
+F[2:end,2:end] -= J[1:end-1,1:end-1]
+
+# Calculating entire jacobian using this insight 
+F_alt = zeros(T,T);
+@Threads.threads for s in 1:T
+    a = copy.(a_ss)
+    a[1] += da[T+1-s]
+    D = yDistributionImpulse(ss_ge, a, T)
+    A = zeros(T)
+    for t in 1:T
+        A[t] = sum(D[t] .* a[t])
+    end
+    F_alt[:,s] = (A .- B - no_shock_excess)/h
+end
+
+Jff = JFromF(F)
+
+lottery = GetLottery.(ss_ge.apol;Agrid = ss_ge.Agrid)
+D1_noshock = ForwardIteration(ss_ge.D, Pi, lottery)
+
+
+
+
+
